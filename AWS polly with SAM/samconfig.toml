@@ -1,0 +1,14 @@
+version = 0.1
+
+[default.deploy.parameters]
+stack_name = "superapp3"
+resolve_s3 = true
+s3_prefix = "superapp3"
+confirm_changeset = true
+capabilities = "CAPABILITY_IAM"
+disable_rollback = true
+parameter_overrides = "BucketName=\"inputdemobucketluis\" NotificationEmail=\"holamundo@yopmail.com\""
+image_repositories = []
+
+[default.global.parameters]
+region = "us-east-1"

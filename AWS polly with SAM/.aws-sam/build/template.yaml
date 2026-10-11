@@ -1,0 +1,229 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: 'Serverless Text-to-Speech application. Converts TXT files uploaded to
+  Amazon S3 into MP3 files using AWS Lambda and Amazon Polly. Sends notifications
+  using Amazon SNS.
+
+  '
+Parameters:
+  BucketName:
+    Type: String
+    Description: Unique name for the S3 bucket
+  NotificationEmail:
+    Type: String
+    Description: Email address that receives SNS notifications
+Globals:
+  Function:
+    Runtime: python3.14
+    MemorySize: 256
+    Timeout: 30
+Resources:
+  TextToSpeechBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName:
+        Ref: BucketName
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        IgnorePublicAcls: true
+        BlockPublicPolicy: true
+        RestrictPublicBuckets: true
+  NotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: text-to-speech-notifications
+  EmailSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Protocol: email
+      Endpoint:
+        Ref: NotificationEmail
+      TopicArn:
+        Ref: NotificationTopic
+  CreateS3FoldersFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName:
+        Fn::Sub: ${AWS::StackName}-create-s3-folders
+      Handler: index.lambda_handler
+      Runtime: python3.14
+      MemorySize: 128
+      Timeout: 30
+      InlineCode: "\nimport boto3\nimport json\nimport urllib.request\n\ns3 = boto3.client(\"\
+        s3\")\n\n\ndef send_response(event, context, status, data=None):\n\n    response_body\
+        \ = {\n        \"Status\": status,\n        \"Reason\": f\"See CloudWatch\
+        \ Log Stream: {context.log_stream_name}\",\n        \"PhysicalResourceId\"\
+        : event.get(\n            \"PhysicalResourceId\",\n            \"S3FolderInitializer\"\
+        \n        ),\n        \"StackId\": event[\"StackId\"],\n        \"RequestId\"\
+        : event[\"RequestId\"],\n        \"LogicalResourceId\": event[\"LogicalResourceId\"\
+        ],\n        \"NoEcho\": False,\n        \"Data\": data or {}\n    }\n\n  \
+        \  response_data = json.dumps(\n        response_body\n    ).encode(\"utf-8\"\
+        )\n\n    request = urllib.request.Request(\n        event[\"ResponseURL\"\
+        ],\n        data=response_data,\n        method=\"PUT\"\n    )\n\n    request.add_header(\n\
+        \        \"Content-Type\",\n        \"\"\n    )\n\n    request.add_header(\n\
+        \        \"Content-Length\",\n        str(len(response_data))\n    )\n\n \
+        \   urllib.request.urlopen(request)\n\n\ndef lambda_handler(event, context):\n\
+        \n    bucket = event[\n        \"ResourceProperties\"\n    ][\"BucketName\"\
+        ]\n\n    try:\n\n        request_type = event[\"RequestType\"]\n\n       \
+        \ if request_type in [\n            \"Create\",\n            \"Update\"\n\
+        \        ]:\n\n            print(\n                f\"Creating S3 folders\
+        \ in {bucket}\"\n            )\n\n            s3.put_object(\n           \
+        \     Bucket=bucket,\n                Key=\"input/\"\n            )\n\n  \
+        \          s3.put_object(\n                Bucket=bucket,\n              \
+        \  Key=\"output/\"\n            )\n\n            print(\n                \"\
+        S3 folders created successfully\"\n            )\n\n\n        elif request_type\
+        \ == \"Delete\":\n\n            print(\n                \"Deleting S3 folder\
+        \ placeholder objects\"\n            )\n\n            s3.delete_object(\n\
+        \                Bucket=bucket,\n                Key=\"input/\"\n        \
+        \    )\n\n            s3.delete_object(\n                Bucket=bucket,\n\
+        \                Key=\"output/\"\n            )\n\n\n        send_response(\n\
+        \            event,\n            context,\n            \"SUCCESS\",\n    \
+        \        {\n                \"Bucket\": bucket\n            }\n        )\n\
+        \n\n    except Exception as error:\n\n        print(\n            f\"ERROR:\
+        \ {str(error)}\"\n        )\n\n        send_response(\n            event,\n\
+        \            context,\n            \"FAILED\",\n            {\n          \
+        \      \"Error\": str(error)\n            }\n        )\n"
+      Policies:
+      - Statement:
+        - Sid: CreateS3FolderObjects
+          Effect: Allow
+          Action:
+          - s3:PutObject
+          - s3:DeleteObject
+          Resource:
+            Fn::Sub:
+            - arn:${AWS::Partition}:s3:::${Bucket}/*
+            - Bucket:
+                Ref: BucketName
+  CreateS3Folders:
+    Type: Custom::CreateS3Folders
+    DependsOn:
+    - TextToSpeechBucket
+    - CreateS3FoldersFunction
+    Properties:
+      ServiceToken:
+        Fn::GetAtt:
+        - CreateS3FoldersFunction
+        - Arn
+      BucketName:
+        Ref: BucketName
+  TextToSpeechFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: text-to-polly
+      CodeUri: TextToSpeechFunction
+      Handler: lambda_function.lambda_handler
+      Description: 'Converts TXT files uploaded to Amazon S3 into MP3 audio files
+        using Amazon Polly.
+
+        '
+      Environment:
+        Variables:
+          OUTPUT_BUCKET:
+            Ref: BucketName
+          OUTPUT_PREFIX: output/
+          POLLY_VOICE_ID: Mia
+          POLLY_ENGINE: standard
+          SNS_TOPIC_ARN:
+            Ref: NotificationTopic
+      Policies:
+      - Statement:
+        - Sid: ReadInputFiles
+          Effect: Allow
+          Action:
+          - s3:GetObject
+          Resource:
+            Fn::Sub:
+            - arn:${AWS::Partition}:s3:::${Bucket}/input/*
+            - Bucket:
+                Ref: BucketName
+        - Sid: WriteOutputFiles
+          Effect: Allow
+          Action:
+          - s3:PutObject
+          Resource:
+            Fn::Sub:
+            - arn:${AWS::Partition}:s3:::${Bucket}/output/*
+            - Bucket:
+                Ref: BucketName
+        - Sid: UseAmazonPolly
+          Effect: Allow
+          Action:
+          - polly:SynthesizeSpeech
+          - polly:StartSpeechSynthesisTask
+          - polly:GetSpeechSynthesisTask
+          Resource: '*'
+        - Sid: PublishSNS
+          Effect: Allow
+          Action:
+          - sns:Publish
+          Resource:
+            Ref: NotificationTopic
+      Events:
+        TextFileUploaded:
+          Type: S3
+          Properties:
+            Bucket:
+              Ref: TextToSpeechBucket
+            Events:
+            - s3:ObjectCreated:*
+            Filter:
+              S3Key:
+                Rules:
+                - Name: prefix
+                  Value: input/
+                - Name: suffix
+                  Value: .txt
+    Metadata:
+      SamResourceId: TextToSpeechFunction
+Outputs:
+  BucketName:
+    Description: 'S3 bucket used by the Text-to-Speech application
+
+      '
+    Value:
+      Ref: BucketName
+  InputPath:
+    Description: 'Upload TXT files to this S3 path
+
+      '
+    Value:
+      Fn::Sub:
+      - s3://${Bucket}/input/
+      - Bucket:
+          Ref: BucketName
+  OutputPath:
+    Description: 'Generated MP3 files are stored here
+
+      '
+    Value:
+      Fn::Sub:
+      - s3://${Bucket}/output/
+      - Bucket:
+          Ref: BucketName
+  LambdaFunctionName:
+    Description: 'Main Lambda function
+
+      '
+    Value:
+      Ref: TextToSpeechFunction
+  LambdaFunctionArn:
+    Description: 'ARN of the main Lambda function
+
+      '
+    Value:
+      Fn::GetAtt:
+      - TextToSpeechFunction
+      - Arn
+  SNSTopicArn:
+    Description: 'SNS topic used for notifications
+
+      '
+    Value:
+      Ref: NotificationTopic
+  NotificationEmail:
+    Description: 'Email configured for SNS notifications
+
+      '
+    Value:
+      Ref: NotificationEmail

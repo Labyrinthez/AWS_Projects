@@ -1,0 +1,529 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+
+Description: >
+  Serverless Text-to-Speech application.
+  Converts TXT files uploaded to Amazon S3 into MP3 files
+  using AWS Lambda and Amazon Polly.
+  Sends notifications using Amazon SNS.
+
+
+# =========================================================
+# PARAMETERS
+# =========================================================
+
+Parameters:
+
+  BucketName:
+    Type: String
+    Description: Unique name for the S3 bucket
+
+  NotificationEmail:
+    Type: String
+    Description: Email address that receives SNS notifications
+
+
+# =========================================================
+# GLOBAL CONFIGURATION
+# =========================================================
+
+Globals:
+
+  Function:
+    Runtime: python3.14
+    MemorySize: 256
+    Timeout: 30
+
+
+# =========================================================
+# RESOURCES
+# =========================================================
+
+Resources:
+
+
+  # =======================================================
+  # S3 BUCKET
+  # =======================================================
+
+  TextToSpeechBucket:
+
+    Type: AWS::S3::Bucket
+
+    Properties:
+
+      BucketName:
+        Ref: BucketName
+
+      PublicAccessBlockConfiguration:
+
+        BlockPublicAcls: true
+        IgnorePublicAcls: true
+        BlockPublicPolicy: true
+        RestrictPublicBuckets: true
+
+
+  # =======================================================
+  # SNS TOPIC
+  # =======================================================
+
+  NotificationTopic:
+
+    Type: AWS::SNS::Topic
+
+    Properties:
+
+      TopicName: text-to-speech-notifications
+
+
+  # =======================================================
+  # SNS EMAIL SUBSCRIPTION
+  # =======================================================
+
+  EmailSubscription:
+
+    Type: AWS::SNS::Subscription
+
+    Properties:
+
+      Protocol: email
+
+      Endpoint:
+        Ref: NotificationEmail
+
+      TopicArn:
+        Ref: NotificationTopic
+
+
+  # =======================================================
+  # AUXILIARY LAMBDA
+  # CREATES input/ AND output/ IN S3
+  # =======================================================
+
+  CreateS3FoldersFunction:
+
+    Type: AWS::Serverless::Function
+
+    Properties:
+
+      FunctionName:
+        Fn::Sub: "${AWS::StackName}-create-s3-folders"
+
+      Handler: index.lambda_handler
+
+      Runtime: python3.14
+
+      MemorySize: 128
+
+      Timeout: 30
+
+      InlineCode: |
+
+        import boto3
+        import json
+        import urllib.request
+
+        s3 = boto3.client("s3")
+
+
+        def send_response(event, context, status, data=None):
+
+            response_body = {
+                "Status": status,
+                "Reason": f"See CloudWatch Log Stream: {context.log_stream_name}",
+                "PhysicalResourceId": event.get(
+                    "PhysicalResourceId",
+                    "S3FolderInitializer"
+                ),
+                "StackId": event["StackId"],
+                "RequestId": event["RequestId"],
+                "LogicalResourceId": event["LogicalResourceId"],
+                "NoEcho": False,
+                "Data": data or {}
+            }
+
+            response_data = json.dumps(
+                response_body
+            ).encode("utf-8")
+
+            request = urllib.request.Request(
+                event["ResponseURL"],
+                data=response_data,
+                method="PUT"
+            )
+
+            request.add_header(
+                "Content-Type",
+                ""
+            )
+
+            request.add_header(
+                "Content-Length",
+                str(len(response_data))
+            )
+
+            urllib.request.urlopen(request)
+
+
+        def lambda_handler(event, context):
+
+            bucket = event[
+                "ResourceProperties"
+            ]["BucketName"]
+
+            try:
+
+                request_type = event["RequestType"]
+
+                if request_type in [
+                    "Create",
+                    "Update"
+                ]:
+
+                    print(
+                        f"Creating S3 folders in {bucket}"
+                    )
+
+                    s3.put_object(
+                        Bucket=bucket,
+                        Key="input/"
+                    )
+
+                    s3.put_object(
+                        Bucket=bucket,
+                        Key="output/"
+                    )
+
+                    print(
+                        "S3 folders created successfully"
+                    )
+
+
+                elif request_type == "Delete":
+
+                    print(
+                        "Deleting S3 folder placeholder objects"
+                    )
+
+                    s3.delete_object(
+                        Bucket=bucket,
+                        Key="input/"
+                    )
+
+                    s3.delete_object(
+                        Bucket=bucket,
+                        Key="output/"
+                    )
+
+
+                send_response(
+                    event,
+                    context,
+                    "SUCCESS",
+                    {
+                        "Bucket": bucket
+                    }
+                )
+
+
+            except Exception as error:
+
+                print(
+                    f"ERROR: {str(error)}"
+                )
+
+                send_response(
+                    event,
+                    context,
+                    "FAILED",
+                    {
+                        "Error": str(error)
+                    }
+                )
+
+
+      Policies:
+
+        - Statement:
+
+            - Sid: CreateS3FolderObjects
+
+              Effect: Allow
+
+              Action:
+                - s3:PutObject
+                - s3:DeleteObject
+
+              Resource:
+
+                Fn::Sub:
+
+                  - "arn:${AWS::Partition}:s3:::${Bucket}/*"
+
+                  - Bucket:
+                      Ref: BucketName
+
+
+  # =======================================================
+  # CUSTOM RESOURCE
+  # EXECUTES THE AUXILIARY LAMBDA
+  # =======================================================
+
+  CreateS3Folders:
+
+    Type: Custom::CreateS3Folders
+
+    DependsOn:
+      - TextToSpeechBucket
+      - CreateS3FoldersFunction
+
+    Properties:
+
+      ServiceToken:
+
+        Fn::GetAtt:
+          - CreateS3FoldersFunction
+          - Arn
+
+      BucketName:
+        Ref: BucketName
+
+
+  # =======================================================
+  # MAIN LAMBDA FUNCTION
+  # =======================================================
+
+  TextToSpeechFunction:
+
+    Type: AWS::Serverless::Function
+
+    Properties:
+
+      FunctionName: text-to-polly
+
+      CodeUri: src/
+
+      Handler: lambda_function.lambda_handler
+
+      Description: >
+        Converts TXT files uploaded to Amazon S3
+        into MP3 audio files using Amazon Polly.
+
+
+      # ===================================================
+      # ENVIRONMENT VARIABLES
+      # ===================================================
+
+      Environment:
+
+        Variables:
+
+          OUTPUT_BUCKET:
+            Ref: BucketName
+
+          OUTPUT_PREFIX: output/
+
+          POLLY_VOICE_ID: Mia
+
+          POLLY_ENGINE: standard
+
+          SNS_TOPIC_ARN:
+            Ref: NotificationTopic
+
+
+      # ===================================================
+      # IAM PERMISSIONS
+      # ===================================================
+
+      Policies:
+
+        - Statement:
+
+
+            # =============================================
+            # READ TXT FILES FROM input/
+            # =============================================
+
+            - Sid: ReadInputFiles
+
+              Effect: Allow
+
+              Action:
+                - s3:GetObject
+
+              Resource:
+
+                Fn::Sub:
+
+                  - "arn:${AWS::Partition}:s3:::${Bucket}/input/*"
+
+                  - Bucket:
+                      Ref: BucketName
+
+
+            # =============================================
+            # WRITE MP3 FILES TO output/
+            # =============================================
+
+            - Sid: WriteOutputFiles
+
+              Effect: Allow
+
+              Action:
+                - s3:PutObject
+
+              Resource:
+
+                Fn::Sub:
+
+                  - "arn:${AWS::Partition}:s3:::${Bucket}/output/*"
+
+                  - Bucket:
+                      Ref: BucketName
+
+
+            # =============================================
+            # AMAZON POLLY
+            # =============================================
+
+            - Sid: UseAmazonPolly
+
+              Effect: Allow
+
+              Action:
+                - polly:SynthesizeSpeech
+                - polly:StartSpeechSynthesisTask
+                - polly:GetSpeechSynthesisTask
+
+              Resource: "*"
+
+
+            # =============================================
+            # AMAZON SNS
+            # =============================================
+
+            - Sid: PublishSNS
+
+              Effect: Allow
+
+              Action:
+                - sns:Publish
+
+              Resource:
+                Ref: NotificationTopic
+
+
+      # ===================================================
+      # S3 TRIGGER
+      # ===================================================
+
+      Events:
+
+        TextFileUploaded:
+
+          Type: S3
+
+          Properties:
+
+            Bucket:
+              Ref: TextToSpeechBucket
+
+            Events:
+              - s3:ObjectCreated:*
+
+            Filter:
+
+              S3Key:
+
+                Rules:
+
+                  - Name: prefix
+                    Value: input/
+
+                  - Name: suffix
+                    Value: .txt
+
+
+# =========================================================
+# OUTPUTS
+# =========================================================
+
+Outputs:
+
+
+  BucketName:
+
+    Description: >
+      S3 bucket used by the Text-to-Speech application
+
+    Value:
+      Ref: BucketName
+
+
+  InputPath:
+
+    Description: >
+      Upload TXT files to this S3 path
+
+    Value:
+
+      Fn::Sub:
+
+        - "s3://${Bucket}/input/"
+
+        - Bucket:
+            Ref: BucketName
+
+
+  OutputPath:
+
+    Description: >
+      Generated MP3 files are stored here
+
+    Value:
+
+      Fn::Sub:
+
+        - "s3://${Bucket}/output/"
+
+        - Bucket:
+            Ref: BucketName
+
+
+  LambdaFunctionName:
+
+    Description: >
+      Main Lambda function
+
+    Value:
+      Ref: TextToSpeechFunction
+
+
+  LambdaFunctionArn:
+
+    Description: >
+      ARN of the main Lambda function
+
+    Value:
+
+      Fn::GetAtt:
+        - TextToSpeechFunction
+        - Arn
+
+
+  SNSTopicArn:
+
+    Description: >
+      SNS topic used for notifications
+
+    Value:
+      Ref: NotificationTopic
+
+
+  NotificationEmail:
+
+    Description: >
+      Email configured for SNS notifications
+
+    Value:
+      Ref: NotificationEmail
